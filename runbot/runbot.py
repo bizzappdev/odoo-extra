@@ -214,6 +214,8 @@ class runbot_repo(osv.osv):
             help="Community addon repos which need to be present to run tests."),
         'token': fields.char("Github token"),
         'group_ids': fields.many2many('res.groups', string='Limited to groups'),
+        'db_template': fields.char('db_template', size=256),
+        'db_backup_path': fields.char('db_backup_path', size=256),
     }
     _defaults = {
         'mode': 'poll',
@@ -394,7 +396,7 @@ class runbot_repo(osv.osv):
             else:
                 non_sticky.append(build.id)
         build_ids = sticky.values()
-        build_ids += non_sticky
+        #build_ids += non_sticky
         # terminate extra running builds
         Build.kill(cr, uid, build_ids[running_max:])
         Build.reap(cr, uid, build_ids)
@@ -796,7 +798,12 @@ class runbot_build(osv.osv):
                 if build.repo_id.modules_auto == 'repo':
                     modules_to_test += [
                         os.path.basename(os.path.dirname(a))
-                        for a in glob.glob(build.path('*/__openerp__.py'))
+                        for a in (glob.glob(build.path('*/__openerp__.py'))+
+                          glob.glob(build.path('*/__manifest__.py')))
+                    ]
+                    modules_to_test += [
+                        os.path.basename(os.path.dirname(a))
+                        for a in glob.glob(build.path('*/__manifest__.py'))
                     ]
                     _logger.debug("local modules_to_test for build %s: %s", build.dest, modules_to_test)
 
@@ -815,7 +822,8 @@ class runbot_build(osv.osv):
                 # Finally mark all addons to move to openerp/addons
                 modules_to_move += [
                     os.path.dirname(module)
-                    for module in glob.glob(build.path('*/__openerp__.py'))
+                    for module in (glob.glob(build.path('*/__openerp__.py')) +
+                    glob.glob(build.path('*/__manifest__.py')))
                 ]
 
             # move all addons to server addons path
@@ -831,7 +839,8 @@ class runbot_build(osv.osv):
 
             available_modules = [
                 os.path.basename(os.path.dirname(a))
-                for a in glob.glob(build.server('addons/*/__openerp__.py'))
+                for a in (glob.glob(build.server('addons/*/__openerp__.py'))+
+                          glob.glob(build.server('addons/*/__manifest__.py')))
             ]
             if build.repo_id.modules_auto == 'all' or (build.repo_id.modules_auto != 'none' and has_server):
                 modules_to_test += available_modules
@@ -850,14 +859,17 @@ class runbot_build(osv.osv):
         paths = [os.path.join(datadir, pn, 'filestore', dbname) for pn in 'OpenERP Odoo'.split()]
         run(['rm', '-rf'] + paths)
 
-    def _local_pg_createdb(self, cr, uid, dbname):
+    def _local_pg_createdb(self, cr, uid, dbname, template='template0'):
+        if template in ('false', False, None, '', 'False'):
+           template = 'template0'
         self._local_pg_dropdb(cr, uid, dbname)
         _logger.debug("createdb %s", dbname)
         with local_pgadmin_cursor() as local_cr:
-            local_cr.execute("""CREATE DATABASE "%s" TEMPLATE template0 LC_COLLATE 'C' ENCODING 'unicode'""" % dbname)
+            local_cr.execute("""CREATE DATABASE "%s" TEMPLATE %s  ENCODING 'unicode'""" % (dbname, template))
 
     def cmd(self, cr, uid, ids, context=None):
         """Return a list describing the command to start the build"""
+        datadir = False
         for build in self.browse(cr, uid, ids, context=context):
             # Server
             server_path = build.path("openerp-server")
@@ -867,6 +879,8 @@ class runbot_build(osv.osv):
             # for 6.0 branches
             if not os.path.isfile(server_path):
                 server_path = build.path("bin/openerp-server.py")
+            if not os.path.isfile(server_path):
+                server_path = build.path("odoo-bin")
 
             # commandline
             cmd = [
@@ -899,7 +913,7 @@ class runbot_build(osv.osv):
         #self.run_log(cmd, logfile=self.test_all_path)
         #run(["coverage","html","-d",self.coverage_base_path,"--ignore-errors","--include=*.py"],env={'COVERAGE_FILE': self.coverage_file_path})
 
-        return cmd, build.modules
+        return cmd, build.modules, datadir
 
     def spawn(self, cmd, lock_path, log_path, cpu_limit=None, shell=False):
         def preexec_fn():
@@ -952,9 +966,10 @@ class runbot_build(osv.osv):
 
     def job_10_test_base(self, cr, uid, build, lock_path, log_path):
         build._log('test_base', 'Start test base module')
+        return
         # run base test
         self._local_pg_createdb(cr, uid, "%s-base" % build.dest)
-        cmd, mods = build.cmd()
+        cmd, mods,datadir = build.cmd()
         if grep(build.server("tools/config.py"), "test-enable"):
             cmd.append("--test-enable")
         cmd += ['-d', '%s-base' % build.dest, '-i', 'base', '--stop-after-init', '--log-level=test', '--max-cron-threads=0']
@@ -962,11 +977,23 @@ class runbot_build(osv.osv):
 
     def job_20_test_all(self, cr, uid, build, lock_path, log_path):
         build._log('test_all', 'Start test all modules')
-        self._local_pg_createdb(cr, uid, "%s-all" % build.dest)
-        cmd, mods = build.cmd()
+        self._local_pg_createdb(cr, uid, "%s-all" % build.dest, template=build.repo_id.db_template)
+        cmd, mods,datadir = build.cmd()
         if grep(build.server("tools/config.py"), "test-enable"):
             cmd.append("--test-enable")
-        cmd += ['-d', '%s-all' % build.dest, '-i', openerp.tools.ustr(mods), '--stop-after-init', '--log-level=test', '--max-cron-threads=0']
+        if build.repo_id.db_template:
+            if datadir:
+                if not os.path.exists(os.path.join(datadir, 'filestore')):
+                    os.mkdir(os.path.join(datadir, 'filestore'))
+                if not os.path.exists(os.path.join(datadir, 'filestore', '%s-all'%build.dest)):
+                    os.mkdir(os.path.join(datadir, 'filestore', '%s-all' % build.dest))
+                logging.info('cp %s %s -rf' %(build.repo_id.db_backup_path, os.path.join(datadir, 'filestore')))
+                os.system('cp %s %s -rf' %(build.repo_id.db_backup_path, os.path.join(datadir, 'filestore', '%s-all' % build.dest)))
+                logging.info("3333333333333333333333# %s %s %s"%(os.path.join(datadir, '%s-all' % build.dest),  openerp.tools.ustr(mods), build.repo_id.db_backup_path))
+            cmd += ['-d', '%s-all' % build.dest, '-u', 'all', '--stop-after-init', '--log-level=test', '--max-cron-threads=0']
+            logging.info("44444444444444 %s"%cmd)
+        else:
+            cmd += ['-d', '%s-all' % build.dest, '-i', openerp.tools.ustr(mods), '--stop-after-init', '--log-level=test', '--max-cron-threads=0']
         # reset job_start to an accurate job_20 job_time
         build.write({'job_start': now()})
         return self.spawn(cmd, lock_path, log_path, cpu_limit=2100)
@@ -992,7 +1019,7 @@ class runbot_build(osv.osv):
         build.github_status()
 
         # run server
-        cmd, mods = build.cmd()
+        cmd, mods,datadir = build.cmd()
         if os.path.exists(build.server('addons/im_livechat')):
             cmd += ["--workers", "2"]
             cmd += ["--longpolling-port", "%d" % (build.port + 1)]

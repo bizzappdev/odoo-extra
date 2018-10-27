@@ -24,6 +24,8 @@
                         <field name="dependency_ids" widget="many2many_tags"/>
                         <field name="modules"/>
                         <field name="modules_auto"/>
+                        <field name="db_template"/>
+                        <field name="db_backup_path"/>
                         <field name="token"/>
                         <field name="group_ids" widget="many2many_tags"/>
                         <field name="hook_time" readonly="1"/>
